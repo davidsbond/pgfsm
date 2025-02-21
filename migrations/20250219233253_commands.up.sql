@@ -1,0 +1,10 @@
+BEGIN;
+
+CREATE TABLE IF NOT EXISTS pgfsm_command
+(
+    id   BIGSERIAL NOT NULL PRIMARY KEY,
+    kind TEXT      NOT NULL,
+    data BYTEA     NOT NULL
+);
+
+COMMIT;
