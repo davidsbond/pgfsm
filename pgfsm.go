@@ -20,7 +20,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"time"
 )
 
 type (
@@ -95,26 +94,38 @@ func (fsm *FSM) Handle(handler Handler) {
 // Write a Command to the FSM. This Command will be encoded using the Encoding implementation and stored within the
 // database, where it can then be read and the relevant Handler invoked.
 func (fsm *FSM) Write(ctx context.Context, cmd Command) error {
-	fsm.options.logger.
-		With(slog.String("command_kind", cmd.Kind())).
-		InfoContext(ctx, "writing command")
-
 	return transaction(ctx, fsm.db, func(ctx context.Context, tx *sql.Tx) error {
-		return insert(ctx, tx, fsm.options.encoder, cmd)
+		switch command := cmd.(type) {
+		case batchCommand:
+			for _, cmd = range command {
+				fsm.options.logger.
+					With(slog.String("command_kind", cmd.Kind())).
+					InfoContext(ctx, "writing command")
+
+				if err := insert(ctx, tx, fsm.options.encoder, cmd); err != nil {
+					return err
+				}
+			}
+		default:
+			fsm.options.logger.
+				With(slog.String("command_kind", cmd.Kind())).
+				InfoContext(ctx, "writing command")
+
+			return insert(ctx, tx, fsm.options.encoder, cmd)
+		}
+
+		return nil
 	})
 }
 
 // Read commands from the FSM. For each command read, the relevant Handler implementation will be invoked. This method
 // blocks until the provided context is cancelled, or a Handler implementation returns an error.
 func (fsm *FSM) Read(ctx context.Context) error {
-	ticker := time.NewTicker(time.Second / 10)
-	defer ticker.Stop()
-
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-ticker.C:
+		default:
 			if err := fsm.next(ctx); err != nil {
 				return err
 			}
@@ -154,10 +165,26 @@ func (fsm *FSM) next(ctx context.Context) error {
 		}
 
 		if cmd != nil {
-			log.With(slog.String("received_command_kind", cmd.Kind())).
-				InfoContext(ctx, "received additional command")
 
-			if err = insert(ctx, tx, fsm.options.encoder, cmd); err != nil {
+			switch command := cmd.(type) {
+			case batchCommand:
+				for _, cmd = range command {
+					log.With(slog.String("received_command_kind", cmd.Kind())).
+						InfoContext(ctx, "received additional command")
+
+					if err = insert(ctx, tx, fsm.options.encoder, cmd); err != nil {
+						return err
+					}
+				}
+
+			default:
+				log.With(slog.String("received_command_kind", cmd.Kind())).
+					InfoContext(ctx, "received additional command")
+
+				err = insert(ctx, tx, fsm.options.encoder, cmd)
+			}
+
+			if err != nil {
 				return err
 			}
 		}
@@ -248,4 +275,19 @@ func UseEncoding(e Encoding) Option {
 // slog.DiscardHandler and will not write any logs.
 func UseLogger(l *slog.Logger) Option {
 	return func(o *options) { o.logger = l.WithGroup("pgfsm") }
+}
+
+type (
+	batchCommand []Command
+)
+
+func (cmd batchCommand) Kind() string {
+	return ""
+}
+
+// Batch returns a single Command implementation that wraps multiple other Command implementations. This can be used
+// to return multiple commands at once when returning from a CommandHandler function. Or to send multiple commands to
+// the FSM at once using FSM.Write.
+func Batch(commands ...Command) Command {
+	return batchCommand(commands)
 }

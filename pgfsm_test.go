@@ -69,23 +69,33 @@ func TestFSM_ReadWrite(t *testing.T) {
 
 	fsm.Handle(pgfsm.CommandHandler[TestCommandA](func(ctx context.Context, a TestCommandA) (pgfsm.Command, error) {
 		handledA = true
+
 		return TestCommandB{Foo: a.Foo + 1}, nil
 	}))
 
 	fsm.Handle(pgfsm.CommandHandler[TestCommandB](func(ctx context.Context, b TestCommandB) (pgfsm.Command, error) {
 		handledB = true
-		return TestCommandC{Foo: b.Foo + 1}, nil
+
+		return pgfsm.Batch(
+			TestCommandC{Foo: b.Foo + 1},
+			TestCommandC{Foo: b.Foo + 1},
+		), nil
 	}))
 
 	fsm.Handle(pgfsm.CommandHandler[TestCommandC](func(ctx context.Context, c TestCommandC) (pgfsm.Command, error) {
 		handledC = true
 		assert.EqualValues(t, 3, c.Foo)
+
 		return nil, nil
 	}))
 
 	group, ctx := errgroup.WithContext(ctx)
 	group.Go(func() error {
-		return fsm.Write(ctx, TestCommandA{Foo: 1})
+		return fsm.Write(ctx, pgfsm.Batch(
+			TestCommandA{Foo: 1},
+			TestCommandA{Foo: 1},
+			TestCommandA{Foo: 1},
+		))
 	})
 
 	group.Go(func() error {
