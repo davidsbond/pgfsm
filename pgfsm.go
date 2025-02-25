@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"time"
 )
 
 type (
@@ -142,24 +143,42 @@ type (
 // intended to be used as a single entrypoint for commands. This method should use a type switch on the pointer types
 // of your commands and react accordingly.
 func (fsm *FSM) Read(ctx context.Context, h Handler) error {
+	interval := fsm.options.minPollInterval
+	timer := time.NewTimer(interval)
+	defer timer.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		default:
-			if err := fsm.next(ctx, h); err != nil {
+		case <-timer.C:
+			err := fsm.next(ctx, h)
+			switch {
+			case errors.Is(err, errNoCommands):
+				interval = min(interval*2, fsm.options.maxPollInterval)
+				timer.Reset(interval)
+			case err != nil:
 				return err
+			default:
+				interval = fsm.options.minPollInterval
+				timer.Reset(interval)
 			}
 		}
 	}
 }
 
+var (
+	errNoCommands = errors.New("no commands")
+)
+
 func (fsm *FSM) next(ctx context.Context, h Handler) error {
+	fsm.options.logger.DebugContext(ctx, "checking for new commands")
+
 	return transaction(ctx, fsm.db, func(ctx context.Context, tx *sql.Tx) error {
 		id, kind, data, err := next(ctx, tx)
 		switch {
 		case errors.Is(err, sql.ErrNoRows):
-			return nil
+			return errNoCommands
 		case err != nil:
 			return err
 		}
@@ -221,6 +240,8 @@ type (
 		skipUnknownCommands bool
 		encoder             Encoding
 		logger              *slog.Logger
+		minPollInterval     time.Duration
+		maxPollInterval     time.Duration
 	}
 
 	// The Option type is a function that can modify the behaviour of the FSM.
@@ -232,6 +253,8 @@ func defaultOptions() options {
 		skipUnknownCommands: false,
 		encoder:             &JSON{},
 		logger:              slog.New(slog.DiscardHandler),
+		minPollInterval:     time.Millisecond,
+		maxPollInterval:     time.Second * 5,
 	}
 }
 
@@ -251,6 +274,17 @@ func SkipUnknownCommands() Option {
 // By default, the FSM will use the JSON.
 func UseEncoding(e Encoding) Option {
 	return func(o *options) { o.encoder = e }
+}
+
+// PollInterval is an Option implementation that configures the minimum and maximum frequency at which Command implementations
+// will be read from the database. Each time the FSM checks for commands and finds none, it will half the frequency at
+// which it checks up to the maximum value. This is done to prevent excessive load on the database at times where there
+// are few commands being written. The default values are 1ms and 5s.
+func PollInterval(min, max time.Duration) Option {
+	return func(o *options) {
+		o.minPollInterval = min
+		o.maxPollInterval = max
+	}
 }
 
 // UseLogger is an Option implementation that modifies the logger used by the FSM. By default, the FSM uses

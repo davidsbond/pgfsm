@@ -55,6 +55,7 @@ func TestFSM_ReadWrite(t *testing.T) {
 		pgfsm.SkipUnknownCommands(),
 		pgfsm.UseEncoding(&pgfsm.GOB{}),
 		pgfsm.UseLogger(logger),
+		pgfsm.PollInterval(time.Millisecond, time.Minute),
 	)
 	require.NoError(t, err)
 
@@ -64,7 +65,7 @@ func TestFSM_ReadWrite(t *testing.T) {
 		handledC bool
 	)
 
-	ctx, cancel := context.WithTimeout(t.Context(), time.Second*10)
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second*5)
 	defer cancel()
 
 	pgfsm.RegisterCommand[TestCommandA](fsm)
