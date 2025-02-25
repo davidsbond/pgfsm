@@ -64,19 +64,20 @@ func (e UnknownCommandError) Error() string {
 }
 
 // New returns a new instance of the FSM type that will read commands from the provided sql.DB instance. This function
-// will perform database migrations to ensure that the required tables exist within the database. This table is named
-// pgfsm_migration which hopefully will never conflict with an existing table within your chosen database.
+// will perform database migrations to ensure that the required tables exist within the database. These database objects
+// will reside in their own schema named pgfsm. The user connecting to the database for this function will require
+// the necessary permissions to create database objects.
 //
 // You can also provide zero or more Option functions to modify the behaviour of the FSM. Please see the Option type
 // for specifics.
-func New(db *sql.DB, options ...Option) (*FSM, error) {
-	if err := migrateUp(db); err != nil {
-		return nil, err
-	}
-
+func New(ctx context.Context, db *sql.DB, options ...Option) (*FSM, error) {
 	opts := defaultOptions()
 	for _, o := range options {
 		o(&opts)
+	}
+
+	if err := migrateUp(ctx, db, opts.logger); err != nil {
+		return nil, err
 	}
 
 	return &FSM{
@@ -179,7 +180,7 @@ func (fsm *FSM) next(ctx context.Context, h Handler) error {
 
 		cmd := factory()
 		if err = fsm.options.encoder.Decode(data, cmd); err != nil {
-			return fmt.Errorf("failed to decode command %q: %w", kind, err)
+			return fmt.Errorf("failed to decode command %d: %w", id, err)
 		}
 
 		log.InfoContext(ctx, "handling command")

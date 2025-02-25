@@ -51,7 +51,7 @@ func TestFSM_ReadWrite(t *testing.T) {
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
-	fsm, err := pgfsm.New(db,
+	fsm, err := pgfsm.New(t.Context(), db,
 		pgfsm.SkipUnknownCommands(),
 		pgfsm.UseEncoding(&pgfsm.GOB{}),
 		pgfsm.UseLogger(logger),
