@@ -27,11 +27,12 @@ type (
 	// to handle these commands in order. Because a database is being used as the command store, no leadership is
 	// required among the FSM instances and commands will be processed in order using an ordinal identifier.
 	//
-	// Handler implementations should be registered prior to calling FSM.Read to ensure commands can be processed.
+	// Command implementations should be registered prior to calling FSM.Read using the RegisterCommand function to ensure
+	// that commands can be processed.
 	FSM struct {
-		db       *sql.DB
-		handlers map[string]Handler
-		options  options
+		db               *sql.DB
+		commandFactories map[string]func() any
+		options          options
 	}
 
 	// The Command interface is used to describe types implemented by package consumers that represent the contents
@@ -79,16 +80,26 @@ func New(db *sql.DB, options ...Option) (*FSM, error) {
 	}
 
 	return &FSM{
-		db:       db,
-		options:  opts,
-		handlers: make(map[string]Handler),
+		db:               db,
+		options:          opts,
+		commandFactories: make(map[string]func() any),
 	}, nil
 }
 
-// Handle registers a Handler implementation with the FSM which will be invoked when a Command with a matching kind is
-// read from the database. This method should be called with all your handlers prior to calling FSM.Read.
-func (fsm *FSM) Handle(handler Handler) {
-	fsm.handlers[handler.kind()] = handler
+// RegisterCommand registers a Command implementation with the FSM. This function must be called for each of your
+// Command implementations so that the FSM knows how to decode them. This function's parameterized type must be the
+// value of your Command implementation.
+//
+// For example:
+//
+// pgfsm.RegisterCommand[MyCommand](fsm)
+func RegisterCommand[T Command](fsm *FSM) {
+	var cmd T
+
+	fsm.commandFactories[cmd.Kind()] = func() any {
+		var out T
+		return &out
+	}
 }
 
 // Write a Command to the FSM. This Command will be encoded using the Encoding implementation and stored within the
@@ -118,22 +129,31 @@ func (fsm *FSM) Write(ctx context.Context, cmd Command) error {
 	})
 }
 
-// Read commands from the FSM. For each command read, the relevant Handler implementation will be invoked. This method
-// blocks until the provided context is cancelled, or a Handler implementation returns an error.
-func (fsm *FSM) Read(ctx context.Context) error {
+type (
+	// The Handler type is a function used with the FSM.Read method and is invoked per-command read by the FSM. A
+	// type switch should be used on the cmd parameter for your individual Command implementations as a pointer of
+	// the concrete type.
+	Handler func(ctx context.Context, cmd any) (Command, error)
+)
+
+// Read commands from the FSM. For each command read, the provided Handler implementation will be invoked. This method
+// blocks until the provided context is cancelled, or the Handler implementation returns an error. The Handler is
+// intended to be used as a single entrypoint for commands. This method should use a type switch on the pointer types
+// of your commands and react accordingly.
+func (fsm *FSM) Read(ctx context.Context, h Handler) error {
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		default:
-			if err := fsm.next(ctx); err != nil {
+			if err := fsm.next(ctx, h); err != nil {
 				return err
 			}
 		}
 	}
 }
 
-func (fsm *FSM) next(ctx context.Context) error {
+func (fsm *FSM) next(ctx context.Context, h Handler) error {
 	return transaction(ctx, fsm.db, func(ctx context.Context, tx *sql.Tx) error {
 		id, kind, data, err := next(ctx, tx)
 		switch {
@@ -148,7 +168,7 @@ func (fsm *FSM) next(ctx context.Context) error {
 			slog.Int64("command_id", id),
 		)
 
-		h, ok := fsm.handlers[kind]
+		factory, ok := fsm.commandFactories[kind]
 		switch {
 		case !ok && fsm.options.skipUnknownCommands:
 			log.WarnContext(ctx, "skipping unknown command")
@@ -157,81 +177,42 @@ func (fsm *FSM) next(ctx context.Context) error {
 			return UnknownCommandError{Kind: kind}
 		}
 
+		cmd := factory()
+		if err = fsm.options.encoder.Decode(data, cmd); err != nil {
+			return fmt.Errorf("failed to decode command %q: %w", kind, err)
+		}
+
 		log.InfoContext(ctx, "handling command")
-		cmd, err := h.handle(ctx, fsm.options.encoder, data)
+		returned, err := h(ctx, cmd)
 		if err != nil {
 			log.ErrorContext(ctx, "error handling command")
 			return err
 		}
 
-		if cmd != nil {
-
-			switch command := cmd.(type) {
+		if returned != nil {
+			switch command := returned.(type) {
 			case batchCommand:
-				for _, cmd = range command {
-					log.With(slog.String("received_command_kind", cmd.Kind())).
+				for _, batched := range command {
+					log.With(slog.String("received_command_kind", batched.Kind())).
 						InfoContext(ctx, "received additional command")
 
-					if err = insert(ctx, tx, fsm.options.encoder, cmd); err != nil {
+					if err = insert(ctx, tx, fsm.options.encoder, batched); err != nil {
 						return err
 					}
 				}
 
 			default:
-				log.With(slog.String("received_command_kind", cmd.Kind())).
+				log.With(slog.String("received_command_kind", returned.Kind())).
 					InfoContext(ctx, "received additional command")
 
-				err = insert(ctx, tx, fsm.options.encoder, cmd)
-			}
-
-			if err != nil {
-				return err
+				if err = insert(ctx, tx, fsm.options.encoder, command); err != nil {
+					return err
+				}
 			}
 		}
 
 		return remove(ctx, tx, id)
 	})
-}
-
-type (
-	// The Handler interface describes types that can process and decode individual commands read from the
-	// database. This interface isn't intended to be implemented by consumers of this package. Rather, they
-	// should wrap their handler function using the NewHandler method, which allows you to maintain type
-	// safety by setting an Encoding on the FSM.
-	Handler interface {
-		handle(context.Context, Encoding, []byte) (Command, error)
-		kind() string
-	}
-
-	// The CommandHandler type is a function that consumers of this package are expected to implement and register
-	// with the FSM in order to handle their self-defined Command implementations. This function will be invoked each
-	// time the FSM finds a Command with a matching kind and allows an optional command to be returned in response
-	// to the one read.
-	//
-	// Returning a nil Command should be used to finish handling a chain of commands. If this function returns an
-	// error, the read command will remain within the FSM and the error will be propagated up to the FSM.Read method,
-	// causing the FSM to terminate.
-	CommandHandler[T Command] func(context.Context, T) (Command, error)
-)
-
-func (ch CommandHandler[T]) handle(ctx context.Context, encoder Encoding, p []byte) (Command, error) {
-	var input T
-
-	if err := encoder.Decode(p, &input); err != nil {
-		return nil, err
-	}
-
-	return ch(ctx, input)
-}
-
-func (ch CommandHandler[T]) kind() string {
-	var cmd T
-
-	// Note: Your IDE may complain of a possible nil pointer dereference here. This won't be an issue when Command
-	// implementations are values. If they are used as pointers, the method will still be called. A nil pointer
-	// dereference could occur if the Kind implementation attempts to construct the string using member fields but
-	// really these should always be constants.
-	return cmd.Kind()
 }
 
 type (

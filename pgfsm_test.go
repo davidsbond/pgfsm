@@ -67,27 +67,9 @@ func TestFSM_ReadWrite(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), time.Second*10)
 	defer cancel()
 
-	fsm.Handle(pgfsm.CommandHandler[TestCommandA](func(ctx context.Context, a TestCommandA) (pgfsm.Command, error) {
-		handledA = true
-
-		return TestCommandB{Foo: a.Foo + 1}, nil
-	}))
-
-	fsm.Handle(pgfsm.CommandHandler[TestCommandB](func(ctx context.Context, b TestCommandB) (pgfsm.Command, error) {
-		handledB = true
-
-		return pgfsm.Batch(
-			TestCommandC{Foo: b.Foo + 1},
-			TestCommandC{Foo: b.Foo + 1},
-		), nil
-	}))
-
-	fsm.Handle(pgfsm.CommandHandler[TestCommandC](func(ctx context.Context, c TestCommandC) (pgfsm.Command, error) {
-		handledC = true
-		assert.EqualValues(t, 3, c.Foo)
-
-		return nil, nil
-	}))
+	pgfsm.RegisterCommand[TestCommandA](fsm)
+	pgfsm.RegisterCommand[TestCommandB](fsm)
+	pgfsm.RegisterCommand[TestCommandC](fsm)
 
 	group, ctx := errgroup.WithContext(ctx)
 	group.Go(func() error {
@@ -99,7 +81,25 @@ func TestFSM_ReadWrite(t *testing.T) {
 	})
 
 	group.Go(func() error {
-		return fsm.Read(ctx)
+		return fsm.Read(ctx, func(ctx context.Context, cmd any) (pgfsm.Command, error) {
+			switch msg := cmd.(type) {
+			case *TestCommandA:
+				handledA = true
+				return TestCommandB{Foo: msg.Foo + 1}, nil
+			case *TestCommandB:
+				handledB = true
+				return pgfsm.Batch(
+					TestCommandC{Foo: msg.Foo + 1},
+					TestCommandC{Foo: msg.Foo + 1},
+				), nil
+			case *TestCommandC:
+				handledC = true
+				return nil, nil
+			default:
+				assert.Fail(t, "should be skipping unknown commands")
+				return nil, nil
+			}
+		})
 	})
 
 	err = group.Wait()
