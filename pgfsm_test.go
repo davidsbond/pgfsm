@@ -2,7 +2,6 @@ package pgfsm_test
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"log/slog"
 	"net/url"
@@ -10,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	_ "github.com/lib/pq"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sync/errgroup"
@@ -113,7 +112,7 @@ func TestFSM_ReadWrite(t *testing.T) {
 	assert.True(t, handledC)
 }
 
-func testDB(t *testing.T) *sql.DB {
+func testDB(t *testing.T) *pgxpool.Pool {
 	t.Helper()
 
 	u := &url.URL{
@@ -124,14 +123,14 @@ func testDB(t *testing.T) *sql.DB {
 		RawQuery: "sslmode=disable",
 	}
 
-	db, err := sql.Open("postgres", u.String())
+	db, err := pgxpool.New(t.Context(), u.String())
 	require.NoError(t, err)
 
 	t.Cleanup(func() {
-		assert.NoError(t, db.Close())
+		db.Close()
 	})
 
-	require.NoError(t, db.PingContext(t.Context()))
+	require.NoError(t, db.Ping(t.Context()))
 
 	return db
 }

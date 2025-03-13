@@ -16,11 +16,13 @@ package pgfsm
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"fmt"
 	"log/slog"
 	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 type (
@@ -31,7 +33,7 @@ type (
 	// Command implementations should be registered prior to calling FSM.Read using the RegisterCommand function to ensure
 	// that commands can be processed.
 	FSM struct {
-		db               *sql.DB
+		db               *pgxpool.Pool
 		commandFactories map[string]func() any
 		options          options
 	}
@@ -64,14 +66,14 @@ func (e UnknownCommandError) Error() string {
 	return fmt.Sprintf("unknown command type %q", e.Kind)
 }
 
-// New returns a new instance of the FSM type that will read commands from the provided sql.DB instance. This function
+// New returns a new instance of the FSM type that will read commands from the provided pgxpool.Pool instance. This function
 // will perform database migrations to ensure that the required tables exist within the database. These database objects
 // will reside in their own schema named pgfsm. The user connecting to the database for this function will require
 // the necessary permissions to create database objects.
 //
 // You can also provide zero or more Option functions to modify the behaviour of the FSM. Please see the Option type
 // for specifics.
-func New(ctx context.Context, db *sql.DB, options ...Option) (*FSM, error) {
+func New(ctx context.Context, db *pgxpool.Pool, options ...Option) (*FSM, error) {
 	opts := defaultOptions()
 	for _, o := range options {
 		o(&opts)
@@ -107,7 +109,7 @@ func RegisterCommand[T Command](fsm *FSM) {
 // Write a Command to the FSM. This Command will be encoded using the Encoding implementation and stored within the
 // database, where it can then be read and the relevant Handler invoked.
 func (fsm *FSM) Write(ctx context.Context, cmd Command) error {
-	return transaction(ctx, fsm.db, func(ctx context.Context, tx *sql.Tx) error {
+	return transaction(ctx, fsm.db, func(ctx context.Context, tx pgx.Tx) error {
 		switch command := cmd.(type) {
 		case batchCommand:
 			for _, cmd = range command {
@@ -174,10 +176,10 @@ var (
 func (fsm *FSM) next(ctx context.Context, h Handler) error {
 	fsm.options.logger.DebugContext(ctx, "checking for new commands")
 
-	return transaction(ctx, fsm.db, func(ctx context.Context, tx *sql.Tx) error {
+	return transaction(ctx, fsm.db, func(ctx context.Context, tx pgx.Tx) error {
 		id, kind, data, err := next(ctx, tx)
 		switch {
-		case errors.Is(err, sql.ErrNoRows):
+		case errors.Is(err, pgx.ErrNoRows):
 			return errNoCommands
 		case err != nil:
 			return err
