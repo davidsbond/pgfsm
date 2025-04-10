@@ -18,11 +18,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"golang.org/x/sync/errgroup"
 )
 
 type (
@@ -79,7 +80,7 @@ func New(ctx context.Context, db *pgxpool.Pool, options ...Option) (*FSM, error)
 		o(&opts)
 	}
 
-	if err := migrateUp(ctx, db, opts.logger); err != nil {
+	if err := migrateUp(ctx, db); err != nil {
 		return nil, err
 	}
 
@@ -113,19 +114,11 @@ func (fsm *FSM) Write(ctx context.Context, cmd Command) error {
 		switch command := cmd.(type) {
 		case batchCommand:
 			for _, cmd = range command {
-				fsm.options.logger.
-					With(slog.String("command_kind", cmd.Kind())).
-					InfoContext(ctx, "writing command")
-
 				if err := insert(ctx, tx, fsm.options.encoder, cmd); err != nil {
 					return err
 				}
 			}
 		default:
-			fsm.options.logger.
-				With(slog.String("command_kind", cmd.Kind())).
-				InfoContext(ctx, "writing command")
-
 			return insert(ctx, tx, fsm.options.encoder, cmd)
 		}
 
@@ -174,76 +167,92 @@ var (
 )
 
 func (fsm *FSM) next(ctx context.Context, h Handler) error {
-	fsm.options.logger.DebugContext(ctx, "checking for new commands")
-
 	return transaction(ctx, fsm.db, func(ctx context.Context, tx pgx.Tx) error {
-		id, kind, data, err := next(ctx, tx)
+		records, err := next(ctx, tx, fsm.options.concurrency)
 		switch {
-		case errors.Is(err, pgx.ErrNoRows):
+		case len(records) == 0:
 			return errNoCommands
 		case err != nil:
 			return err
 		}
 
-		log := fsm.options.logger.With(
-			slog.String("command_kind", kind),
-			slog.Int64("command_id", id),
-		)
+		return fsm.handleCommands(ctx, tx, records, h)
+	})
+}
 
-		factory, ok := fsm.commandFactories[kind]
-		switch {
-		case !ok && fsm.options.skipUnknownCommands:
-			log.WarnContext(ctx, "skipping unknown command")
-			return remove(ctx, tx, id)
-		case !ok && !fsm.options.skipUnknownCommands:
-			return UnknownCommandError{Kind: kind}
-		}
+func (fsm *FSM) handleCommands(ctx context.Context, tx pgx.Tx, records []record, h Handler) error {
+	var mux sync.Mutex
+	commands := make([]Command, 0)
+	group, gCtx := errgroup.WithContext(ctx)
 
-		cmd := factory()
-		if err = fsm.options.encoder.Decode(data, cmd); err != nil {
-			return fmt.Errorf("failed to decode command %d: %w", id, err)
-		}
+	for _, r := range records {
+		group.Go(func() error {
+			cmd, err := fsm.handleCommand(gCtx, r, h)
+			switch {
+			case err != nil:
+				return err
+			case cmd == nil:
+				return nil
+			}
 
-		log.InfoContext(ctx, "handling command")
-		returned, err := h(ctx, cmd)
-		if err != nil {
-			log.ErrorContext(ctx, "error handling command")
-			return err
-		}
-
-		if returned != nil {
-			switch command := returned.(type) {
+			mux.Lock()
+			defer mux.Unlock()
+			switch command := cmd.(type) {
 			case batchCommand:
 				for _, batched := range command {
-					log.With(slog.String("received_command_kind", batched.Kind())).
-						InfoContext(ctx, "received additional command")
-
-					if err = insert(ctx, tx, fsm.options.encoder, batched); err != nil {
-						return err
-					}
+					commands = append(commands, batched)
 				}
 
 			default:
-				log.With(slog.String("received_command_kind", returned.Kind())).
-					InfoContext(ctx, "received additional command")
-
-				if err = insert(ctx, tx, fsm.options.encoder, command); err != nil {
-					return err
-				}
+				commands = append(commands, command)
 			}
-		}
 
-		return remove(ctx, tx, id)
-	})
+			return nil
+		})
+	}
+
+	if err := group.Wait(); err != nil {
+		return err
+	}
+
+	for _, cmd := range commands {
+		if err := insert(ctx, tx, fsm.options.encoder, cmd); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (fsm *FSM) handleCommand(ctx context.Context, r record, h Handler) (Command, error) {
+	factory, ok := fsm.commandFactories[r.kind]
+	switch {
+	case !ok && fsm.options.skipUnknownCommands:
+		return nil, nil
+	case !ok && !fsm.options.skipUnknownCommands:
+		return nil, UnknownCommandError{Kind: r.kind}
+	}
+
+	cmd := factory()
+	if err := fsm.options.encoder.Decode(r.data, cmd); err != nil {
+		return nil, fmt.Errorf("failed to decode command %d: %w", r.id, err)
+	}
+
+	returned, err := h(ctx, cmd)
+	if err != nil {
+		return nil, err
+	}
+
+	return returned, nil
 }
 
 type (
 	options struct {
 		skipUnknownCommands bool
 		encoder             Encoding
-		logger              *slog.Logger
 		minPollInterval     time.Duration
 		maxPollInterval     time.Duration
+		concurrency         uint
 	}
 
 	// The Option type is a function that can modify the behaviour of the FSM.
@@ -254,9 +263,9 @@ func defaultOptions() options {
 	return options{
 		skipUnknownCommands: false,
 		encoder:             &JSON{},
-		logger:              slog.New(slog.DiscardHandler),
 		minPollInterval:     time.Millisecond,
 		maxPollInterval:     time.Second * 5,
+		concurrency:         1,
 	}
 }
 
@@ -278,6 +287,14 @@ func UseEncoding(e Encoding) Option {
 	return func(o *options) { o.encoder = e }
 }
 
+// SetConcurrency is an Option implementation that changes the number of commands that can be processed at the same time.
+// It defaults to 1. Concurrent commands are processed within the same transaction. This means that within a batch of
+// commands, should any fail then all commands within the batch will be returned to the database and any subsequent
+// commands rolled back.
+func SetConcurrency(concurrency uint) Option {
+	return func(o *options) { o.concurrency = concurrency }
+}
+
 // PollInterval is an Option implementation that configures the minimum and maximum frequency at which Command implementations
 // will be read from the database. Each time the FSM checks for commands and finds none, it will half the frequency at
 // which it checks up to the maximum value. This is done to prevent excessive load on the database at times where there
@@ -287,12 +304,6 @@ func PollInterval(min, max time.Duration) Option {
 		o.minPollInterval = min
 		o.maxPollInterval = max
 	}
-}
-
-// UseLogger is an Option implementation that modifies the logger used by the FSM. By default, the FSM uses
-// slog.DiscardHandler and will not write any logs.
-func UseLogger(l *slog.Logger) Option {
-	return func(o *options) { o.logger = l.WithGroup("pgfsm") }
 }
 
 type (

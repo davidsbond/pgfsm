@@ -3,9 +3,8 @@ package pgfsm_test
 import (
 	"context"
 	"errors"
-	"log/slog"
 	"net/url"
-	"os"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -48,20 +47,18 @@ func TestFSM_ReadWrite(t *testing.T) {
 
 	db := testDB(t)
 
-	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
-
 	fsm, err := pgfsm.New(t.Context(), db,
 		pgfsm.SkipUnknownCommands(),
 		pgfsm.UseEncoding(&pgfsm.GOB{}),
-		pgfsm.UseLogger(logger),
 		pgfsm.PollInterval(time.Millisecond, time.Minute),
+		pgfsm.SetConcurrency(10),
 	)
 	require.NoError(t, err)
 
 	var (
-		handledA bool
-		handledB bool
-		handledC bool
+		handledA atomic.Bool
+		handledB atomic.Bool
+		handledC atomic.Bool
 	)
 
 	ctx, cancel := context.WithTimeout(t.Context(), time.Second*5)
@@ -84,16 +81,16 @@ func TestFSM_ReadWrite(t *testing.T) {
 		return fsm.Read(ctx, func(ctx context.Context, cmd any) (pgfsm.Command, error) {
 			switch msg := cmd.(type) {
 			case *TestCommandA:
-				handledA = true
+				handledA.Store(true)
 				return TestCommandB{Foo: msg.Foo + 1}, nil
 			case *TestCommandB:
-				handledB = true
+				handledB.Store(true)
 				return pgfsm.Batch(
 					TestCommandC{Foo: msg.Foo + 1},
 					TestCommandC{Foo: msg.Foo + 1},
 				), nil
 			case *TestCommandC:
-				handledC = true
+				handledC.Store(true)
 				return nil, nil
 			default:
 				assert.Fail(t, "should be skipping unknown commands")
@@ -107,9 +104,9 @@ func TestFSM_ReadWrite(t *testing.T) {
 		require.NoError(t, err)
 	}
 
-	assert.True(t, handledA)
-	assert.True(t, handledB)
-	assert.True(t, handledC)
+	assert.True(t, handledA.Load())
+	assert.True(t, handledB.Load())
+	assert.True(t, handledC.Load())
 }
 
 func testDB(t *testing.T) *pgxpool.Pool {

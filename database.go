@@ -4,7 +4,6 @@ import (
 	"context"
 	_ "embed"
 	"errors"
-	"log/slog"
 	"strings"
 
 	"github.com/jackc/pgx/v5"
@@ -46,50 +45,54 @@ func insert(ctx context.Context, tx pgx.Tx, encoder Encoding, cmd Command) error
 	return err
 }
 
-func next(ctx context.Context, tx pgx.Tx) (int64, string, []byte, error) {
-	const q = `
-		SELECT id, kind, data FROM pgfsm.command 
-		ORDER BY id ASC
-		FOR UPDATE SKIP LOCKED
-		LIMIT 1
-	`
-
-	var (
-		id   int64
+type (
+	record struct {
+		id   uint64
 		kind string
 		data []byte
-	)
+	}
+)
 
-	if err := tx.QueryRow(ctx, q).Scan(&id, &kind, &data); err != nil {
-		return 0, "", []byte{}, err
+func next(ctx context.Context, tx pgx.Tx, limit uint) ([]record, error) {
+	const q = `
+		DELETE FROM pgfsm.command WHERE id IN (
+		    SELECT id FROM pgfsm.command 
+			ORDER BY id ASC
+			FOR UPDATE SKIP LOCKED
+			LIMIT $1
+		) RETURNING id, kind, data
+	`
+
+	rows, err := tx.Query(ctx, q, limit)
+	if err != nil {
+		return nil, err
 	}
 
-	return id, kind, data, nil
-}
+	records := make([]record, 0, limit)
+	defer rows.Close()
 
-func remove(ctx context.Context, tx pgx.Tx, id int64) error {
-	const q = `DELETE FROM pgfsm.command WHERE id = $1`
+	for rows.Next() {
+		var r record
+		if err = rows.Scan(&r.id, &r.kind, &r.data); err != nil {
+			return nil, err
+		}
 
-	_, err := tx.Exec(ctx, q, id)
-	return err
+		records = append(records, r)
+	}
+
+	return records, rows.Err()
 }
 
 //go:embed migrate.sql
 var migration string
 
-func migrateUp(ctx context.Context, db *pgxpool.Pool, logger *slog.Logger) error {
-	logger.DebugContext(ctx, "performing migrations")
-
+func migrateUp(ctx context.Context, db *pgxpool.Pool) error {
 	statements := strings.Split(migration, ";")
 
 	for _, statement := range statements {
 		if strings.TrimSpace(statement) == "" {
 			continue
 		}
-
-		logger.
-			With(slog.String("statement", statement)).
-			DebugContext(ctx, "executing statement")
 
 		if _, err := db.Exec(ctx, statement); err != nil {
 			return err

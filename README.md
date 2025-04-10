@@ -17,12 +17,13 @@ any other tables applications built on top of this package may use.
 
 Commands use an ordinal identifier to ensure that they're processed in order of insertion. This is an implementation
 detail not exposed to users of the package. Once processed, their entry in the `pgfsm.command` table is removed,
-providing once-only processing of individual commands.
+providing once-only processing of individual commands. When using a concurrency of greater than one, this package
+provides at-least-once processing of commands in batches. Batches of commands are dependent on eachother as they are
+handled within the same transaction. If a single command within the batch fails, all commands in the batch are returned
+to the database.
 
-When reading commands, a transaction is used to ensure that should command processing fail, the contents of the command
-are returned to the `pgfsm.command` table with the same identifier. This package uses a registration system for commands
-utilising parameterised types that allows commands to be directly decoded into their concrete types without excessive
-usage of reflection.
+This package uses a registration system for commands utilising parameterised types that allows commands to be directly
+decoded into their concrete types without excessive usage of reflection.
 
 When handling a command, you have the option to return a command as a result. This allows commands to act as a graph of
 sorts. Where the successful processing of one command creates zero or more child commands. This can be used to define
